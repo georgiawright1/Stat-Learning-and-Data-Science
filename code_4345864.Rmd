@@ -1,0 +1,359 @@
+---
+title: "STAT 1361 Final Project"
+author: "Georgia Wright"
+date: "4/13/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+#chunk for loading packages
+library(dplyr)
+library(tidyr)
+library(leaps)
+library(glmnet)
+library(boot)
+library(splines)
+library(gam)
+library(tree)
+library(randomForest)
+library(BART)
+library(gbm)
+library(glmnet)
+```
+
+```{r}
+#download data set
+bikes<- read.csv("train.csv")
+```
+
+```{r}
+#all variables must be numeric
+#convert date to character, split into 3 columns, join
+bikes$Date<- as.character(bikes$Date)
+date<- strsplit(bikes$Date, "/", fixed = FALSE, perl = FALSE, useBytes = FALSE)
+date<- as.data.frame(t(as.data.frame(date)))
+colnames(date)<- c("day", "month", "year")
+
+#convert month, day, and year into integers
+date$month<- as.integer(date$month)
+date$day<- as.integer(date$day)
+date$year<- as.integer(date$year)
+
+bikes1<- data.frame(bikes, date)
+bikes1<-rownames(bikes1)<- c(1:6552)
+rownames(date)<- c(1:6552)
+bikes1<- data.frame(bikes, date)
+
+#convert seasons into categorical integer
+bikes1$winter<- ifelse(bikes1$Seasons == "Winter", 1, 0)
+bikes1$autumn<- ifelse(bikes1$Seasons == "Autumn", 1, 0)
+bikes1$spring<- ifelse(bikes1$Season == "Spring", 1, 0)
+
+#convert holiday into categorical integer
+bikes1$holiday<- ifelse(bikes1$Holiday == "No Holiday", 0, 1)
+
+#convert functioning into categorical integer
+bikes1$functions<- ifelse(bikes1$Functioning == "Yes", 1, 0)
+```
+
+```{r}
+#create df with numeric and categorical variables
+df<- bikes1 %>% select(Count, Date, month, day, year, Hour, Temperature, Humidity, Wind, Visibility, Dew, Solar, Rainfall, Snowfall, winter, autumn, spring, holiday, functions, ID)
+```
+
+```{r}
+#split data into training and test sets
+set.seed(1)
+train<- sample(c(TRUE, FALSE), nrow(df), replace=TRUE)
+test<-(!train)
+
+train<- df[train, ]
+test<- df[test, ]
+
+```
+
+```{r}
+#calculate summary statistics for qualitative variables
+df2<- df %>% select(Count, month, day, year, Hour, Temperature, Humidity, Wind, Visibility, Dew, Solar, Rainfall, Snowfall)
+nrow(df)
+#means
+means<- colMeans(df2)
+format(means, scientific = FALSE)
+#standard deviations
+sapply(df2, sd)
+#medians
+sapply(df2, median)
+```
+```{r}
+#distinct years and months
+table(df2$year)
+table(df2$month)
+table(bikes$Seasons)
+table(bikes$Holiday)
+table(bikes$Functioning)
+```
+
+```{r}
+#full linear model
+full<- lm(Count ~ month + day + year + Hour + Temperature + Humidity + Wind + Visibility + Dew + Solar + Rainfall + Snowfall + winter + autumn + spring + holiday + functions, data=train)
+summary(full)
+
+pred <- predict(full, test)
+mean((test$Count - pred)^2) #full linear model mse is 193,617.8
+```
+
+
+```{r}
+#best subset selection on training, training MSE
+train.df<- as.data.frame(train)
+regfit.best <- regsubsets(Count ~ month + day + year + Hour + Temperature + Humidity + Wind + Visibility + Dew + Solar + Rainfall + Snowfall + winter + autumn + spring + holiday + functions, data=train.df, nvmax = 17)
+```
+
+
+```{r}
+#test mse
+test.df <- as.data.frame(test)
+test.mat <- model.matrix(Count ~ month + day + year + Hour + Temperature + Humidity + Wind + Visibility + Dew + Solar + Rainfall + Snowfall + winter + autumn + spring + holiday + functions, data = test.df, nvmax = 17)
+val.errors <- rep(NA, 20)
+for (i in 1:17) {
+    coefi <- coef(regfit.best, id = i)
+    pred <- test.mat[, names(coefi)] %*% coefi
+    val.errors[i] <- mean((pred - test$Count)^2)
+}
+plot(val.errors, xlab = "Number of predictors", ylab = "Test MSE", pch = 19, type = "b")
+```
+
+```{r}
+val.errors
+which.min(val.errors) #best model has 16 variables, MSE=193602.7
+```
+
+```{r}
+coef(regfit.best, 16) #Dew is not in best model
+```
+
+```{r}
+#BIC, forward selection
+fit.fwd <- regsubsets(Count ~ month + day + year + Hour + Temperature + Humidity + Wind + Visibility + Dew + Solar + Rainfall + Snowfall + winter + autumn + spring + holiday + functions, data= train.df, method = 'forward')
+fit.summary<- summary(fit.fwd)
+fit.summary
+
+which.min(fit.summary$bic) #using bic best model has 8 predictors
+coef(fit.fwd, id=8) #hour, temp, humidity, solar, rainfall, winter, autumn, functions
+
+```
+
+```{r}
+#linear model with 8 predictors from forward selection, lowest BIC 
+fit<- lm(Count~ Hour + Temperature + Humidity + Solar + Rainfall + winter + autumn + functions, data=train.df)
+
+pred <- predict(fit, test.df)
+mean((test.df$Count - pred)^2) #mse is 196,944.9
+```
+
+
+```{r}
+#fit lasso on training, lambda with cv, report test error and number of non-zero coeff
+train.mat<-model.matrix(Count ~ month + day + year + Hour + Temperature + Humidity + Wind + Visibility + Dew + Solar + Rainfall + Snowfall + winter + autumn + spring + holiday + functions, data= train.df)
+test.mat<-model.matrix(Count ~ month + day + year + Hour + Temperature + Humidity + Wind + Visibility + Dew + Solar + Rainfall + Snowfall + winter + autumn + spring + holiday + functions, data= test.df)
+
+set.seed(100)
+cv.out2 <- cv.glmnet(train.mat,train.df$Count,alpha=1)
+lambda2 <- cv.out2$lambda.min
+lambda2
+
+lasso.mod <- glmnet(train.mat,train.df$Count,alpha=1)
+lasso.pred <- predict(lasso.mod,s=lambda2,newx=test.mat)
+mean((lasso.pred - test.df$Count)^2)
+#lasso with tuning paramter=0.166 mse is 193737.8
+
+out<- glmnet(train.df[, -1], train.df$Count, alpha=1)
+lasso.coef<-predict(out, type="coefficients", s=lambda2)[3:19,]
+lasso.coef # Dew has coef of 0, should not be included in the model
+#lasso produces similar mse as best ss
+```
+
+
+
+
+
+```{r}
+#convert date to character, split into 3 columns, join
+bikes$Date<- as.character(bikes$Date)
+date<- strsplit(bikes$Date, "/", fixed = FALSE, perl = FALSE, useBytes = FALSE)
+date<- as.data.frame(t(as.data.frame(date)))
+colnames(date)<- c("month", "day", "year")
+
+#convert month, day, and year into integers
+date$month<- as.integer(date$month)
+date$day<- as.integer(date$day)
+date$year<- as.integer(date$year)
+
+bikes2<- data.frame(bikes, date)
+bikes2<-rownames(bikes2)<- c(1:6552)
+rownames(date)<- c(1:6552)
+bikes2<- data.frame(bikes, date)
+#data set with date split and categorical variables
+data<- bikes2 %>% select(Count, month, day, year, Hour, Temperature, Humidity, Wind, Visibility, Dew, Solar, Rainfall, Snowfall, Seasons, Holiday, Functioning, ID)
+
+data$Seasons<- as.factor(data$Seasons)
+data$Holiday<- as.factor(data$Holiday)
+data$Functioning<- as.factor(data$Functioning)
+```
+
+```{r}
+#split data into training and test sets
+set.seed(1)
+training<- sample(c(TRUE, FALSE), nrow(data), replace=TRUE)
+testing<-(!training)
+
+training<- data[training, ]
+testing<- data[testing, ]
+
+```
+
+```{r}
+#build full tree 
+training.df<- as.data.frame(training)
+testing.df<- as.data.frame(testing)
+tree.bikes <- tree(Count ~ month + day + year + Hour + Temperature + Humidity + Wind + Visibility + Dew + Solar + Rainfall + Snowfall + Seasons + Holiday + Functioning, data = training.df)
+summary(tree.bikes)
+
+plot(tree.bikes)
+text(tree.bikes, pretty = 0)
+
+pred <- predict(tree.bikes, testing.df)
+mean((testing.df$Count - pred)^2) #tree mse is 142,697.6
+
+```
+
+```{r}
+#prune full tree
+cv.bikes = cv.tree(tree.bikes, FUN=prune.tree)
+par(mfrow=c(1, 2))
+plot(cv.bikes$size, cv.bikes$dev, type="b", xlab="model size", ylab="cross-validation errors")
+plot(cv.bikes$k, cv.bikes$dev, type="b", xlab="k", ylab="cross-validation errors")
+
+prune.bikes <- prune.tree(tree.bikes, best = 9)
+par(mfrow = c(1, 1))
+plot(prune.bikes)
+text(prune.bikes, pretty = 0)
+
+pred.prune <- predict(prune.bikes, testing.df)
+mean((testing.df$Count - pred.prune)^2) #pruned tree mse is 152,974.1
+#pruning did not improve mse
+```
+
+
+
+```{r}
+#bagging
+set.seed(100)
+bag.bikes = randomForest(Count ~ month + day + year + Hour + Temperature + Humidity + Wind + Visibility + Dew + Solar + Rainfall + Snowfall + Seasons + Holiday + Functioning, data = training, mtry = 15, ntree = 50, importance=TRUE)
+bag.bikes
+
+bag.pred <- predict(bag.bikes, testing)
+mean((testing$Count - bag.pred)^2) #bagging mse is 57,139.38 
+#bagging produces best test mse
+
+importance(bag.bikes)
+```
+
+
+```{r}
+#random forests 
+#mtry=p/3=15/3=5
+train.rf<- training %>% select(Count, month, day, year, Hour, Temperature, Humidity, Wind, Visibility, Dew, Solar, Rainfall, Snowfall, Seasons, Holiday, Functioning)
+set.seed(100)
+rf.2 <- randomForest(Count ~ month + day + year + Hour + Temperature + Humidity + Wind + Visibility + Dew + Solar + Rainfall + Snowfall + Seasons + Holiday + Functioning, data = train.rf, mtry = 5, importance = TRUE)
+yhat.rf.2 <- predict(rf.2, newdata = testing) 
+mean((yhat.rf.2 - testing$Count)^2) #random forests with mtry=5 mse is 58,415.07
+
+importance(rf.2)
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+#download test data set
+test.set<- read.csv("test.csv")
+
+```
+
+```{r}
+#convert date to character, split into 3 columns, join
+test.set$Date<- as.character(test.set$Date)
+dates<- strsplit(test.set$Date, "/", fixed = FALSE, perl = FALSE, useBytes = FALSE)
+dates<- as.data.frame(t(as.data.frame(dates)))
+colnames(dates)<- c("month", "day", "year")
+
+#convert month, day, and year into integers
+dates$month<- as.integer(dates$month)
+dates$day<- as.integer(dates$day)
+dates$year<- as.integer(dates$year)
+
+test.set.1<- data.frame(test.set, dates)
+test.set.1<-rownames(test.set.1)<- c(1:2208)
+rownames(dates)<- c(1:2208)
+test.set.1<- data.frame(test.set, dates)
+```
+
+```{r}
+test.set.2<- test.set.1 %>% select(month, day, year, Hour, Temperature, Humidity, Wind, Visibility, Dew, Solar, Rainfall, Snowfall, Seasons, Holiday, Functioning, ID)
+
+#convert seasons, holiday, and functioning into factors
+test.set.2$Seasons<- as.factor(test.set.2$Seasons)
+test.set.2$Holiday<- as.factor(test.set.2$Holiday)
+test.set.2$Functioning<- as.factor(test.set.2$Functioning)
+```
+
+```{r}
+#predict using bagging
+test.set.2$bag.pred = predict(bag.bikes, test.set.2)
+
+predict<- test.set.2 %>% select(ID, bag.pred)
+
+predict<- rename(predict, Count=bag.pred)
+```
+
+```{r}
+student_id<-rep(4345864, times=2208)
+id<- data.frame(student_id)
+
+final<- data.frame(predict, id)
+```
+
+```{r, eval=FALSE}
+write.csv(final, "/Users/georgiawright/Library/Mobile Documents/com~apple~CloudDocs/Spring 2021-22/Stat Learning\\testing_predictions_4345864.csv", row.names=FALSE)
+
+#read.csv("testing_predictions_4345864.csv")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
